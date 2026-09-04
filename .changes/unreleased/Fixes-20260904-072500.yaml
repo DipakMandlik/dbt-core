@@ -1,0 +1,7 @@
+kind: Fixes
+body: Sort JSON keys within each package (not just the list of packages) when computing the package-lock.yaml sha1_hash, so Fusion produces the same hash as dbt Core for logically identical packages.
+time: 2026-09-04T07:25:00.000000+05:30
+custom:
+    author: DipakMandlik
+    issue: "13915"
+    project: dbt-core
