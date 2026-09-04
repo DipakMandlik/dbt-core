@@ -112,9 +112,20 @@ pub fn fusion_sha1_hash_packages(
     packages: &[DbtPackageEntry],
     use_v2_compatible_package_downloads: bool,
 ) -> String {
+    // dbt Core hashes `json.dumps(package.to_dict(), sort_keys=True)` per
+    // package (see `_create_sha1_hash` in `core/dbt/task/deps.py`), so the
+    // JSON *keys* within a single package are alphabetized, not just the
+    // resulting per-package strings. `serde_json::to_string(p)` instead
+    // serializes struct fields in declaration order, producing a different
+    // hash for logically identical packages. Route through `serde_json::Value`
+    // first: with the `preserve_order` feature off (this workspace's default
+    // for serde_json -- verified by a test below), `Value::Object` is backed
+    // by a `BTreeMap`, so serializing the value instead of the struct directly
+    // sorts the keys the same way Python's `sort_keys=True` does. See
+    // https://github.com/dbt-labs/dbt-core/issues/13915.
     let mut package_strs = packages
         .iter()
-        .map(|p| serde_json::to_string(p).unwrap())
+        .map(|p| serde_json::to_string(&serde_json::to_value(p).unwrap()).unwrap())
         .collect::<Vec<String>>();
     package_strs.sort();
     // Add flag for installing v2-compatible downloads from Package Hub to hash
@@ -270,6 +281,66 @@ pub fn sanitize_git_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbt_schemas::schemas::packages::{HubPackage, PackageVersion};
+
+    /// Canary for the `fusion_sha1_hash_packages` fix below: it depends on
+    /// serde_json's default (non-`preserve_order`) behavior, where
+    /// `Value::Object` is backed by a `BTreeMap` and therefore serializes
+    /// keys alphabetically. If this ever starts failing -- e.g. some
+    /// dependency enables serde_json's `preserve_order` feature workspace
+    /// -wide -- `fusion_sha1_hash_packages` silently stops sorting keys and
+    /// https://github.com/dbt-labs/dbt-core/issues/13915 regresses.
+    #[test]
+    fn serde_json_value_serializes_object_keys_alphabetically_by_default() {
+        #[derive(serde::Serialize)]
+        struct Unsorted {
+            zebra: i32,
+            apple: i32,
+            mango: i32,
+        }
+        let value = serde_json::to_value(Unsorted {
+            zebra: 1,
+            apple: 2,
+            mango: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"apple":2,"mango":3,"zebra":1}"#
+        );
+    }
+
+    /// Regression test for https://github.com/dbt-labs/dbt-core/issues/13915:
+    /// dbt Core hashes each package via `json.dumps(package.to_dict(),
+    /// sort_keys=True)`, alphabetizing keys *within* each package -- not
+    /// just sorting the resulting list of per-package strings (which
+    /// `fusion_sha1_hash_packages` already did before this fix). `HubPackage`
+    /// declares its fields as `package`, `version`, `install_prerelease` (not
+    /// alphabetical), so a naive `serde_json::to_string` on the struct would
+    /// hash a differently-ordered JSON string than dbt Core does for the
+    /// same logical package.
+    #[test]
+    fn fusion_sha1_hash_packages_sorts_keys_within_each_package() {
+        let package = DbtPackageEntry::Hub(HubPackage {
+            package: "dbt-labs/dbt_utils".to_string(),
+            version: Some(PackageVersion::String("1.3.0".to_string())),
+            install_prerelease: Some(true),
+        });
+
+        let actual = fusion_sha1_hash_packages(&[package], false);
+
+        // Independently built with keys already in alphabetical order
+        // (install_prerelease, package, version) -- matching what dbt
+        // Core's `sort_keys=True` produces -- and hashed the same way
+        // `fusion_sha1_hash_packages` does, so this only passes if the fix
+        // actually reorders the struct's declared field order rather than
+        // coincidentally matching it.
+        let expected_json =
+            r#"{"install_prerelease":true,"package":"dbt-labs/dbt_utils","version":"1.3.0"}"#;
+        let expected = format!("{:x}", sha1::Sha1::digest(expected_json.as_bytes()));
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn missing_dbt_project_error_normalizes_dotdot_in_path() {
